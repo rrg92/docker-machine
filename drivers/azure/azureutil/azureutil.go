@@ -564,13 +564,14 @@ func (a AzureClient) removeOSDiskBlob(ctx context.Context, resourceGroup, vmName
 // CreateVirtualMachine creates a VM according to the specifications and adds an SSH key to access the VM
 func (a AzureClient) CreateVirtualMachine(ctx context.Context, resourceGroup, name, location, size, availabilitySetID, networkInterfaceID,
 	username, sshPublicKey, imageName, imagePlan, customData string, storageAccount *storage.AccountProperties, isManaged bool,
-	storageType string, diskSize int32, tags map[string]*string, availabilityZone string) error {
+	storageType string, diskSize int32, tags map[string]*string, availabilityZone string,
+	priority string,evictionPolicy string,maxPrice float64) error {
 	// TODO: "VM created from Image cannot have blob based disks. All disks have to be managed disks."
 	imgReference, err := a.getImageReference(ctx, imageName, location)
 	if err != nil {
 		return err
 	}
-
+	
 	var imagePurchasePlan *compute.Plan
 	if imagePlan != "" {
 		imagePurchasePlan, err = a.getImagePurchasePlan(ctx, imagePlan)
@@ -612,7 +613,7 @@ func (a AzureClient) CreateVirtualMachine(ctx context.Context, resourceGroup, na
 	}
 
 	virtualMachinesClient := a.virtualMachinesClient()
-
+			
 	vm := compute.VirtualMachine{
 		Tags:     tags,
 		Location: to.StringPtr(location),
@@ -635,16 +636,44 @@ func (a AzureClient) CreateVirtualMachine(ctx context.Context, resourceGroup, na
 		},
 		Plan: imagePurchasePlan,
 	}
-
-	// The Azure API does not allow you to specify particular Availability Sets
-	// in particular Availability Zones - you can only specify one or the other.
-	// if a user has provided an availability zone it is assumed that
-	// no availability sets should be created / used.
-	if availabilityZone == "" {
+	
+	// Conditionally set the Priority based on the priority variable
+	switch priority {
+		case "Regular":
+			vm.VirtualMachineProperties.Priority = compute.Regular
+		case "Low":
+			vm.VirtualMachineProperties.Priority = compute.Low
+		case "Spot":
+			vm.VirtualMachineProperties.Priority = compute.Spot
+	}
+	
+	// Conditionally set the Priority based on the priority variable
+	switch evictionPolicy {
+		case "Deallocate":
+			vm.VirtualMachineProperties.EvictionPolicy = compute.Deallocate
+		case "Delete":
+			vm.VirtualMachineProperties.EvictionPolicy = compute.Delete
+	}
+	
+	if priority != "" {
+		
+		if maxPrice == 0 {
+			maxPrice = -1
+		}
+		
+		vm.VirtualMachineProperties.BillingProfile = &compute.BillingProfile{MaxPrice: to.Float64Ptr(maxPrice) }
+	}
+	
+	
+	
+	// If specified availabilty zone...
+	if availabilitySetID != "" {
 		vm.VirtualMachineProperties.AvailabilitySet = &compute.SubResource{
 			ID: to.StringPtr(availabilitySetID),
 		}
-	} else {
+	}
+	
+	if availabilityZone != "" {
 		vm.Zones = to.StringSlicePtr([]string{availabilityZone})
 	}
 

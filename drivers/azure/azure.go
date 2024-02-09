@@ -71,6 +71,9 @@ const (
 	flAzureAcceleratedNetworking     = "azure-accelerated-networking"
 	flAzureEnablePublicIPStandardSKU = "azure-enable-public-ip-standard-sku"
 	flAzureAvailabilityZones         = "azure-availability-zone"
+	flAzurePriority        			 = "azure-priority"
+	flAzureEvictionPolicy         	 = "azure-eviction-policy"
+	flAzureMaxPrice        			 = "azure-max-price"
 )
 
 const (
@@ -109,6 +112,9 @@ type Driver struct {
 	AcceleratedNetworking     bool
 	AvailabilityZone          string
 	EnablePublicIPStandardSKU bool
+	Priority 				  string 
+	EvictionPolicy			  string 
+	MaxPrice 				  float64
 
 	OpenPorts      []string
 	PrivateIPAddr  string
@@ -218,7 +224,7 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   flAzureAvailabilitySet,
 			Usage:  "Azure Availability Set to place the virtual machine into",
 			EnvVar: "AZURE_AVAILABILITY_SET",
-			Value:  defaultAzureAvailabilitySet,
+			//Value:  defaultAzureAvailabilitySet,
 		},
 		mcnflag.StringFlag{
 			Name:   flAzureNSG,
@@ -319,6 +325,21 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Specify if an Accelerated Networking NIC should be created for your VM",
 			EnvVar: "AZURE_ACCELERATED_NETWORKING",
 		},
+		mcnflag.StringFlag{
+			Name:   flAzurePriority,
+			Usage:  "Azure Machine Priority (Low,Regular,Spot)",
+			EnvVar: "AZURE_PRIORITY",
+		},
+		mcnflag.StringFlag{
+			Name:   flAzureEvictionPolicy,
+			Usage:  "Azure Eviction Policy (Delete or Deallocate)",
+			EnvVar: "AZURE_EVICTION_POLICY",
+		},
+		mcnflag.StringFlag{
+			Name:   flAzureMaxPrice,
+			Usage:  "Azure Max Price for Spot",
+			EnvVar: "AZURE_MAX_PRICE",
+		},
 	}
 }
 
@@ -381,7 +402,7 @@ func (d *Driver) SetConfigFromFlags(fl drivers.DriverOptions) error {
 		{&d.VirtualNetwork, flAzureVNet},
 		{&d.SubnetName, flAzureSubnet},
 		{&d.SubnetPrefix, flAzureSubnetPrefix},
-		{&d.AvailabilitySet, flAzureAvailabilitySet},
+		//{&d.AvailabilitySet, flAzureAvailabilitySet},
 		{&d.StorageType, flAzureStorageType},
 	}
 	for _, f := range flags {
@@ -390,6 +411,9 @@ func (d *Driver) SetConfigFromFlags(fl drivers.DriverOptions) error {
 			return requiredOptionError(f.flag)
 		}
 	}
+	
+	// Now is optional, and is not default!
+	d.AvailabilitySet = fl.String(flAzureAvailabilitySet) 
 
 	// Optional flags or Flags of other types
 	d.AvailabilityZone = fl.String(flAzureAvailabilityZones)
@@ -419,6 +443,21 @@ func (d *Driver) SetConfigFromFlags(fl drivers.DriverOptions) error {
 	// Set flags on the BaseDriver
 	d.BaseDriver.SSHPort = sshPort
 	d.SetSwarmConfigFromFlags(fl)
+	
+	d.Priority = fl.String(flAzurePriority)
+	d.EvictionPolicy = fl.String(flAzureEvictionPolicy)
+	
+
+	
+	maxPriceStr := fl.String(flAzureMaxPrice)
+	
+	if maxPriceStr != "" {
+		var err error
+		d.MaxPrice,err = strconv.ParseFloat( maxPriceStr, 64)
+		if err != nil {
+			return fmt.Errorf("azure-max-price must be string in format 0.NNNN | (ConversionError:%s)", err)
+		}
+	}
 
 	log.Debug("Set configuration from flags.")
 	return nil
@@ -445,8 +484,10 @@ func (d *Driver) PreCreateCheck() (err error) {
 		if !d.EnablePublicIPStandardSKU {
 			return fmt.Errorf("The Standard Public IP SKU must be enabled when creating resources in specific Availablity Zones (--azure-enable-public-ip-standard-sku)")
 		}
+		
 		if d.AvailabilitySet != "" {
 			log.Warn("Both an Availability Set and Availability Zone were specified. Skipping creation of the Availability Set, only creating resources in the specified Availability Zone.")
+			d.AvailabilitySet = ""
 		}
 	}
 
@@ -521,7 +562,7 @@ func (d *Driver) Create() error {
 		return err
 	}
 	// availability sets and availability zones cannot be used together. The presence of an Availability Zone indicates that an Availability set should not be created / used
-	if d.AvailabilityZone == "" {
+	if d.AvailabilitySet != "" {
 		if err := c.CreateAvailabilitySetIfNotExists(ctx, d.deploymentCtx, d.ResourceGroup, d.AvailabilitySet, d.Location, d.ManagedDisks, int32(d.FaultCount), int32(d.UpdateCount)); err != nil {
 			return err
 		}
@@ -558,7 +599,8 @@ func (d *Driver) Create() error {
 	}
 	if err := c.CreateVirtualMachine(ctx, d.ResourceGroup, d.naming().VM(), d.Location, d.Size, d.deploymentCtx.AvailabilitySetID,
 		d.deploymentCtx.NetworkInterfaceID, d.BaseDriver.SSHUser, d.deploymentCtx.SSHPublicKey, d.Image, d.Plan, customData, d.deploymentCtx.StorageAccount,
-		d.ManagedDisks, d.StorageType, int32(d.DiskSize), d.Tags, d.AvailabilityZone); err != nil {
+		d.ManagedDisks, d.StorageType, int32(d.DiskSize), d.Tags, d.AvailabilityZone,
+		d.Priority,d.EvictionPolicy,d.MaxPrice); err != nil {
 		return err
 	}
 	ip, err := d.GetIP()
@@ -606,7 +648,7 @@ func (d *Driver) Remove() error {
 		return err
 	}
 	// availability sets and availability zones cannot be used together. The absence of any Availability Zones indicates that an Availability set was created and should be deleted.
-	if d.AvailabilityZone == "" {
+	if d.AvailabilitySet != "" {
 		if err := c.CleanupAvailabilitySetIfExists(ctx, d.ResourceGroup, d.AvailabilitySet); err != nil {
 			return err
 		}
