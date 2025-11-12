@@ -3,7 +3,6 @@ package openstack
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -51,6 +50,8 @@ type Driver struct {
 	FlavorId                    string
 	ImageName                   string
 	ImageId                     string
+	ServerGroupName             string
+	ServerGroupId               string
 	KeyPairName                 string
 	NetworkName                 string
 	NetworkId                   string
@@ -222,6 +223,18 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "OS_IMAGE_NAME",
 			Name:   "openstack-image-name",
 			Usage:  "OpenStack image name to use for the instance",
+			Value:  "",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OS_SERVER_GROUP_ID",
+			Name:   "openstack-server-group-id",
+			Usage:  "OpenStack server group id to use for the instance",
+			Value:  "",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OS_SERVER_GROUP_NAME",
+			Name:   "openstack-server-group-name",
+			Usage:  "OpenStack server group name to use for the instance",
 			Value:  "",
 		},
 		mcnflag.StringFlag{
@@ -427,6 +440,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.FlavorName = flags.String("openstack-flavor-name")
 	d.ImageId = flags.String("openstack-image-id")
 	d.ImageName = flags.String("openstack-image-name")
+	d.ServerGroupId = flags.String("openstack-server-group-id")
+	d.ServerGroupName = flags.String("openstack-server-group-name")
 	d.NetworkId = flags.String("openstack-net-id")
 	d.NetworkName = flags.String("openstack-net-name")
 	if flags.String("openstack-sec-groups") != "" {
@@ -450,7 +465,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VolumeSize = flags.Int("openstack-volume-size")
 
 	if flags.String("openstack-user-data-file") != "" {
-		userData, err := ioutil.ReadFile(flags.String("openstack-user-data-file"))
+		userData, err := os.ReadFile(flags.String("openstack-user-data-file"))
 		if err == nil {
 			d.UserData = userData
 		} else {
@@ -669,15 +684,16 @@ func (d *Driver) Remove() error {
 }
 
 const (
-	errorMandatoryEnvOrOption string = "%s must be specified either using the environment variable %s or the CLI option %s"
-	errorMandatoryOption      string = "%s must be specified using the CLI option %s"
-	errorExclusiveOptions     string = "Either %s or %s must be specified, not both"
-	errorBothOptions          string = "Both %s and %s must be specified"
-	errorWrongEndpointType    string = "Endpoint type must be 'publicURL', 'adminURL' or 'internalURL'"
-	errorUnknownFlavorName    string = "Unable to find flavor named %s"
-	errorUnknownImageName     string = "Unable to find image named %s"
-	errorUnknownNetworkName   string = "Unable to find network named %s"
-	errorUnknownTenantName    string = "Unable to find tenant named %s"
+	errorMandatoryEnvOrOption   string = "%s must be specified either using the environment variable %s or the CLI option %s"
+	errorMandatoryOption        string = "%s must be specified using the CLI option %s"
+	errorExclusiveOptions       string = "Either %s or %s must be specified, not both"
+	errorBothOptions            string = "Both %s and %s must be specified"
+	errorWrongEndpointType      string = "Endpoint type must be 'publicURL', 'adminURL' or 'internalURL'"
+	errorUnknownFlavorName      string = "Unable to find flavor named %s"
+	errorUnknownImageName       string = "Unable to find image named %s"
+	errorUnknownServerGroupName string = "Unable to find server group named %s"
+	errorUnknownNetworkName     string = "Unable to find network named %s"
+	errorUnknownTenantName      string = "Unable to find tenant named %s"
 )
 
 func (d *Driver) parseAuthConfig() (*gophercloud.AuthOptions, error) {
@@ -802,6 +818,27 @@ func (d *Driver) resolveIds() error {
 		})
 	}
 
+	if d.ServerGroupName != "" {
+		if err := d.initCompute(); err != nil {
+			return err
+		}
+		serverGroupId, err := d.client.GetServerGroupID(d)
+
+		if err != nil {
+			return err
+		}
+
+		if serverGroupId == "" {
+			return fmt.Errorf(errorUnknownServerGroupName, d.ServerGroupName)
+		}
+
+		d.ServerGroupId = serverGroupId
+		log.Debug("Found server group id using its name", map[string]string{
+			"Name": d.ServerGroupName,
+			"ID":   d.ServerGroupId,
+		})
+	}
+
 	if d.FloatingIpPool != "" && !d.ComputeNetwork {
 		if err := d.initNetwork(); err != nil {
 			return err
@@ -862,7 +899,7 @@ func (d *Driver) loadSSHKey() error {
 		return err
 	}
 	log.Debug("Loading Private Key from", d.PrivateKeyFile)
-	privateKey, err := ioutil.ReadFile(d.PrivateKeyFile)
+	privateKey, err := os.ReadFile(d.PrivateKeyFile)
 	if err != nil {
 		return err
 	}
@@ -870,10 +907,10 @@ func (d *Driver) loadSSHKey() error {
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(d.privateSSHKeyPath(), privateKey, 0600); err != nil {
+	if err := os.WriteFile(d.privateSSHKeyPath(), privateKey, 0600); err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(d.publicSSHKeyPath(), publicKey, 0600); err != nil {
+	if err := os.WriteFile(d.publicSSHKeyPath(), publicKey, 0600); err != nil {
 		return err
 	}
 
@@ -886,7 +923,7 @@ func (d *Driver) createSSHKey() error {
 	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
 	}
-	publicKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
+	publicKey, err := os.ReadFile(d.publicSSHKeyPath())
 	if err != nil {
 		return err
 	}

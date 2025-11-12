@@ -1,12 +1,9 @@
 package crashreport
 
 import (
-	"testing"
-
-	"io/ioutil"
-
 	"os"
 	"path/filepath"
+	"testing"
 
 	"github.com/bugsnag/bugsnag-go"
 	"github.com/stretchr/testify/assert"
@@ -28,11 +25,11 @@ func TestRead(t *testing.T) {
 }
 
 func createTempFile(t *testing.T, content string) string {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(file.Name(), []byte(content), 0644); err != nil {
+	if err := os.WriteFile(file.Name(), []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
 	return file.Name()

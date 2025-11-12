@@ -144,6 +144,13 @@ func (d *Driver) createLegacy() error {
 	if err != nil {
 		return err
 	}
+	log.Info("Fetching MachineID ...")
+	// save the machine id as soon as the VM is created
+	if _, err = d.GetMachineId(); err != nil {
+		// no need to return the error, it is not a blocker for creating the machine,
+		// we will fetch the machineID again after starting the VM
+		log.Warnf("[createLegacy] failed to fetch MachineID for %s: %v", d.MachineName, err)
+	}
 
 	log.Infof("Uploading Boot2docker ISO ...")
 	vm := object.NewVirtualMachine(c.Client, info.Result.(types.ManagedObjectReference))
@@ -274,6 +281,14 @@ func (d *Driver) createFromVmName() error {
 		return err
 	}
 
+	log.Info("Fetching MachineID ...")
+	// save the machine id as soon as the VM is created
+	if _, err = d.GetMachineId(); err != nil {
+		// no need to return the error, it is not a blocker for creating the machine,
+		// we will fetch the machineID again after starting the VM
+		log.Warnf("[createFromVmName] failed to fetch MachineID for %s: %v", d.MachineName, err)
+	}
+
 	// Retrieve the new VM
 	vm := object.NewVirtualMachine(c.Client, info.Result.(types.ManagedObjectReference))
 	if err := d.addNetworks(vm, d.networks); err != nil {
@@ -355,6 +370,14 @@ func (d *Driver) createFromLibraryName() error {
 	obj, err := d.finder.ObjectReference(d.getCtx(), *ref)
 	if err != nil {
 		return err
+	}
+
+	log.Info("Fetching MachineID ...")
+	// save the machine id as soon as the VM is created
+	if _, err = d.GetMachineId(); err != nil {
+		// no need to return the error, it is not a blocker for creating the machine,
+		// we will fetch the machineID again after starting the VM
+		log.Warnf("[createFromLibraryName] failed to fetch MachineID for %s: %v", d.MachineName, err)
 	}
 
 	// At this point, the VM is deployed from content library with defaults from template

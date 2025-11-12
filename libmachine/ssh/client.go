@@ -3,15 +3,15 @@ package ssh
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/pkg/term"
+	"github.com/moby/term"
 	"github.com/rancher/machine/libmachine/log"
 	"github.com/rancher/machine/libmachine/mcnutils"
 	"github.com/rancher/machine/libmachine/util"
@@ -112,6 +112,7 @@ func NewClient(user string, host string, port int, auth *Auth) (Client, error) {
 	}
 
 	log.Debug("Using SSH client type: external")
+	log.Debugf("Using SSH hostname: %s, port: %d", host, port)
 	client, err := NewExternalClient(sshBinaryPath, user, host, port, auth)
 	log.Debug(client)
 	return client, err
@@ -120,7 +121,7 @@ func NewClient(user string, host string, port int, auth *Auth) (Client, error) {
 func NewNativeClient(user, host string, port int, auth *Auth) (Client, error) {
 	config, err := NewNativeConfig(user, auth)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting config for native Go SSH: %s", err)
+		return nil, fmt.Errorf("error getting config for native Go SSH: %s", err)
 	}
 
 	return &NativeClient{
@@ -136,7 +137,7 @@ func NewNativeConfig(user string, auth *Auth) (ssh.ClientConfig, error) {
 	)
 
 	for _, k := range auth.Keys {
-		key, err := ioutil.ReadFile(k)
+		key, err := os.ReadFile(k)
 		if err != nil {
 			return ssh.ClientConfig{}, err
 		}
@@ -172,12 +173,12 @@ func (client *NativeClient) dialSuccess() bool {
 
 func (client *NativeClient) session(command string) (*ssh.Client, *ssh.Session, error) {
 	if err := mcnutils.WaitFor(client.dialSuccess); err != nil {
-		return nil, nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
+		return nil, nil, fmt.Errorf("error attempting SSH client dial: %s", err)
 	}
 
 	conn, err := ssh.Dial("tcp", net.JoinHostPort(client.Hostname, strconv.Itoa(client.Port)), &client.Config)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Mysterious error dialing TCP for SSH (we already succeeded at least once) : %s", err)
+		return nil, nil, fmt.Errorf("mysterious error dialing TCP for SSH (we already succeeded at least once) : %s", err)
 	}
 	session, err := conn.NewSession()
 
@@ -249,7 +250,7 @@ func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser,
 
 	client.openClient = conn
 	client.openSession = session
-	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), nil
+	return io.NopCloser(stdout), io.NopCloser(stderr), nil
 }
 
 func (client *NativeClient) Wait() error {
@@ -339,8 +340,19 @@ func NewExternalClient(sshBinaryPath, user, host string, port int, auth *Auth) (
 		BinaryPath: sshBinaryPath,
 	}
 	var args []string
+	var hostURL string
+	ipAddr, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil, err
+	}
+	if ipAddr.Is6() {
+		hostURL = fmt.Sprintf("http://[%s]", host)
+	} else {
+		hostURL = fmt.Sprintf("http://%s", host)
+	}
+
 	// http proxy should be used for the SSH connection
-	proxy, err := util.GetProxyURL("http://" + host)
+	proxy, err := util.GetProxyURL(hostURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get the http proxy for the exernal client: %v", err)
 	}
@@ -354,6 +366,10 @@ func NewExternalClient(sshBinaryPath, user, host string, port int, auth *Auth) (
 		args = append(baseSSHArgs, "-o", fmt.Sprintf(SSHProxyArg, ncBinaryPath, proxy_url), fmt.Sprintf("%s@%s", user, host))
 	} else {
 		args = append(baseSSHArgs, fmt.Sprintf("%s@%s", user, host))
+	}
+
+	if ipAddr.Is6() {
+		args = append(args, "-6")
 	}
 
 	// If no identities are explicitly provided, also look at the identities

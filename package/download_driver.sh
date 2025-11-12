@@ -12,7 +12,7 @@ if [ -x "$(command -v c_rehash)" ]; then
   c_rehash
 fi
 
-curl -sLO "$1"
+curl -sLO "$1" || echo "Curl failed with error code $?"
 driver_file=$(ls $driver_prefix*)
 driver_name=$(echo "$driver_file" | sed -e "s/^$driver_prefix//" -e "s/[-_\.].*$//")
 driver_path=driver_dir/$driver_prefix$driver_name

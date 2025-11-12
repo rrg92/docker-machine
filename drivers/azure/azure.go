@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -29,7 +28,7 @@ const (
 	defaultAzureLocation        = "westus"
 	defaultSSHUser              = "docker-user" // 'root' not allowed on Azure
 	defaultDockerPort           = 2376
-	defaultAzureImage           = "canonical:UbuntuServer:18.04-LTS:latest"
+	defaultAzureImage           = "canonical:ubuntu-24_04-lts:server-gen1:latest"
 	defaultAzureVNet            = "docker-machine-vnet"
 	defaultAzureSubnet          = "docker-machine"
 	defaultAzureSubnetPrefix    = "192.168.0.0/16"
@@ -547,7 +546,7 @@ func (d *Driver) Create() error {
 
 	var customData string
 	if d.CustomDataFile != "" {
-		buf, err := ioutil.ReadFile(d.CustomDataFile)
+		buf, err := os.ReadFile(d.CustomDataFile)
 		if err != nil {
 			return err
 		}

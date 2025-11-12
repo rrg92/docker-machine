@@ -453,6 +453,7 @@ func (d *Driver) Kill() error {
 func (d *Driver) Remove() error {
 	if d.MachineId == "" {
 		// no guid from config, nothing in vsphere to delete
+		log.Info("MachineID is empty, skipping removing VM")
 		return nil
 	}
 

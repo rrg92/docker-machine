@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
@@ -15,12 +14,14 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/exoscale/egoscale"
+	v3 "github.com/exoscale/egoscale/v3"
+	"github.com/exoscale/egoscale/v3/credentials"
 	"github.com/rancher/machine/libmachine/drivers"
 	rpcdriver "github.com/rancher/machine/libmachine/drivers/rpc"
 	"github.com/rancher/machine/libmachine/log"
 	"github.com/rancher/machine/libmachine/mcnflag"
 	"github.com/rancher/machine/libmachine/mcnutils"
+	"github.com/rancher/machine/libmachine/ssh"
 	"github.com/rancher/machine/libmachine/state"
 )
 
@@ -42,19 +43,17 @@ type Driver struct {
 	PublicKey        string
 	UserDataFile     string
 	UserData         []byte
-	ID               *egoscale.UUID `json:"Id"`
+	ID               v3.UUID `json:"Id"`
 }
 
 const (
-	defaultAPIEndpoint       = "https://api.exoscale.ch/compute"
-	defaultInstanceProfile   = "Small"
-	defaultDiskSize          = 50
-	defaultImage             = "Linux Ubuntu 18.04 LTS 64-bit"
-	defaultAvailabilityZone  = "CH-DK-2"
-	defaultSSHUser           = "root"
-	defaultSecurityGroup     = "docker-machine"
-	defaultAffinityGroupType = "host anti-affinity"
-	defaultCloudInit         = `#cloud-config
+	defaultInstanceProfile  = "Small"
+	defaultDiskSize         = 50
+	defaultImage            = "Linux Ubuntu 24.04 LTS 64-bit"
+	defaultAvailabilityZone = "ch-dk-2"
+	defaultSSHUser          = "root"
+	defaultSecurityGroup    = "rancher-machine"
+	defaultCloudInit        = `#cloud-config
 manage_etc_hosts: localhost
 `
 )
@@ -74,7 +73,7 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "exoscale API key",
 		},
 		mcnflag.StringFlag{
-			EnvVar: "EXOSCALE_API_SECRET",
+			EnvVar: "EXOSCALE_API_SECRET_KEY",
 			Name:   "exoscale-api-secret-key",
 			Usage:  "exoscale API secret key",
 		},
@@ -236,9 +235,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.UserData = []byte(defaultCloudInit)
 	d.SetSwarmConfigFromFlags(flags)
 
-	if d.URL == "" {
-		d.URL = defaultAPIEndpoint
-	}
 	if d.APIKey == "" || d.APISecretKey == "" {
 		return errors.New("missing an API key (--exoscale-api-key) or API secret key (--exoscale-api-secret-key)")
 	}
@@ -273,210 +269,319 @@ func (d *Driver) GetURL() (string, error) {
 	return fmt.Sprintf("tcp://%s", net.JoinHostPort(ip, "2376")), nil
 }
 
-func (d *Driver) client() *egoscale.Client {
-	return egoscale.NewClient(d.URL, d.APIKey, d.APISecretKey)
-}
-
-func (d *Driver) virtualMachine() (*egoscale.VirtualMachine, error) {
-	cs := d.client()
-	virtualMachine := &egoscale.VirtualMachine{
-		ID: d.ID,
-	}
-
-	if err := cs.GetWithContext(context.TODO(), virtualMachine); err != nil {
+func (d *Driver) client(ctx context.Context) (*v3.Client, error) {
+	client, err := v3.NewClient(credentials.NewStaticCredentials(d.APIKey, d.APISecretKey))
+	if err != nil {
 		return nil, err
 	}
 
-	return virtualMachine, nil
+	if d.URL != "" {
+		client = client.WithEndpoint(v3.Endpoint(d.URL))
+	}
+
+	zones, err := client.ListZones(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	zone, err := zones.FindZone(d.AvailabilityZone)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debugf("Availability zone %v = %s", d.AvailabilityZone, zone)
+	client = client.WithEndpoint(zone.APIEndpoint)
+
+	return client, nil
+}
+
+func (d *Driver) getInstance() (*v3.Instance, error) {
+	ctx := context.Background()
+	client, err := d.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return client.GetInstance(ctx, d.ID)
 }
 
 // GetState returns a github.com/machine/libmachine/state.State representing the state of the host (running, stopped, etc.)
 func (d *Driver) GetState() (state.State, error) {
-	vm, err := d.virtualMachine()
+	instance, err := d.getInstance()
 	if err != nil {
 		return state.Error, err
 	}
-	switch vm.State {
-	case "Starting":
+	switch instance.State {
+	case v3.InstanceStateStarting:
 		return state.Starting, nil
-	case "Running":
+	case v3.InstanceStateRunning:
 		return state.Running, nil
-	case "Stopping":
-		return state.Running, nil
-	case "Stopped":
+	case v3.InstanceStateStopping:
+		return state.Stopping, nil
+	case v3.InstanceStateStopped:
 		return state.Stopped, nil
-	case "Destroyed":
+	case v3.InstanceStateDestroying:
 		return state.Stopped, nil
-	case "Expunging":
+	case v3.InstanceStateDestroyed:
 		return state.Stopped, nil
-	case "Migrating":
+	case v3.InstanceStateExpunging:
+		return state.Stopped, nil
+	case v3.InstanceStateMigrating:
 		return state.Paused, nil
-	case "Error":
+	case v3.InstanceStateError:
 		return state.Error, nil
-	case "Unknown":
-		return state.Error, nil
-	case "Shutdowned":
-		return state.Stopped, nil
 	}
 	return state.None, nil
 }
 
-func (d *Driver) createDefaultSecurityGroup(group string) (*egoscale.SecurityGroup, error) {
-	cs := d.client()
-	resp, err := cs.RequestWithContext(context.TODO(), &egoscale.CreateSecurityGroup{
-		Name:        group,
-		Description: "created by docker-machine",
+func (d *Driver) createDefaultSecurityGroup(ctx context.Context, sgName string) (v3.UUID, error) {
+	client, err := d.client(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	op, err := client.CreateSecurityGroup(ctx, v3.CreateSecurityGroupRequest{
+		Name:        sgName,
+		Description: "created by rancher-machine",
 	})
 	if err != nil {
-		return nil, err
-	}
-	sg := resp.(*egoscale.SecurityGroup)
-
-	cidrList := []egoscale.CIDR{
-		*egoscale.MustParseCIDR("0.0.0.0/0"),
-		*egoscale.MustParseCIDR("::/0"),
+		return "", err
 	}
 
-	requests := []egoscale.AuthorizeSecurityGroupIngress{
+	res, err := client.Wait(ctx, op, v3.OperationStateSuccess)
+	if err != nil {
+		return "", err
+	}
+
+	sgID := res.Reference.ID
+	sg := v3.SecurityGroupResource{
+		ID:         sgID,
+		Name:       sgName,
+		Visibility: v3.SecurityGroupResourceVisibilityPrivate,
+	}
+
+	var (
+		dockerPort         int64 = 2376
+		swarmPort          int64 = 3376
+		kubeApiPort        int64 = 6443
+		httpPort           int64 = 80
+		sshPort            int64 = 22
+		rancherWebhookPort int64 = 8443
+		httpsPort          int64 = 443
+		supervisorPort     int64 = 9345
+		nodeExporter       int64 = 9796
+
+		etcdPorts            = []int64{2379, 2380}
+		vxlanPorts           = []int64{4789, 4789}
+		typhaPorts           = []int64{5473, 5473}
+		flannelPorts         = []int64{8472, 8472}
+		otherKubePorts       = []int64{10250, 10252}
+		kubeProxyPorts       = []int64{10256, 10256}
+		nodePorts            = []int64{30000, 32767}
+		calicoPort     int64 = 179
+	)
+
+	publicRules := []v3.AddRuleToSecurityGroupRequest{
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "SSH",
-			CIDRList:        cidrList,
-			Protocol:        "TCP",
-			StartPort:       22,
-			EndPort:         22,
+			Description: "SSH",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   sshPort,
+			EndPort:     sshPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Ping",
-			CIDRList:        []egoscale.CIDR{*egoscale.MustParseCIDR("0.0.0.0/0")},
-			Protocol:        "ICMP",
-			IcmpType:        8,
-			IcmpCode:        0,
+			Description: "Docker",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   dockerPort,
+			EndPort:     dockerPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Ping6",
-			CIDRList:        []egoscale.CIDR{*egoscale.MustParseCIDR("::/0")},
-			Protocol:        "ICMPv6",
-			IcmpType:        128,
-			IcmpCode:        0,
+			Description: "(Legacy) Standalone Swarm",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   swarmPort,
+			EndPort:     swarmPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Docker",
-			CIDRList:        cidrList,
-			Protocol:        "TCP",
-			StartPort:       2376,
-			EndPort:         2377,
+			Description: "Rancher webhook",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   rancherWebhookPort,
+			EndPort:     rancherWebhookPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Legacy Standalone Swarm",
-			CIDRList:        cidrList,
-			Protocol:        "TCP",
-			StartPort:       3376,
-			EndPort:         3377,
+			Description: "Kubernetes API",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   kubeApiPort,
+			EndPort:     kubeApiPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Communication among nodes",
-			Protocol:        "TCP",
-			StartPort:       7946,
-			EndPort:         7946,
-			UserSecurityGroupList: []egoscale.UserSecurityGroup{
-				sg.UserSecurityGroup(),
-			},
+			Description: "HTTP",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   httpPort,
+			EndPort:     httpPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Communication among nodes",
-			Protocol:        "UDP",
-			StartPort:       7946,
-			EndPort:         7946,
-			UserSecurityGroupList: []egoscale.UserSecurityGroup{
-				sg.UserSecurityGroup(),
-			},
+			Description: "HTTPS",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   httpsPort,
+			EndPort:     httpsPort,
 		},
 		{
-			SecurityGroupID: sg.ID,
-			Description:     "Overlay network traffic",
-			Protocol:        "UDP",
-			StartPort:       4789,
-			EndPort:         4789,
-			UserSecurityGroupList: []egoscale.UserSecurityGroup{
-				sg.UserSecurityGroup(),
-			},
+			Description: "NodePort range (TCP)",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:   nodePorts[0],
+			EndPort:     nodePorts[1],
+		},
+		{
+			Description: "NodePort range (UDP)",
+			Protocol:    v3.AddRuleToSecurityGroupRequestProtocolUDP,
+			StartPort:   nodePorts[0],
+			EndPort:     nodePorts[1],
 		},
 	}
 
-	for _, req := range requests {
-		_, err := cs.RequestWithContext(context.TODO(), &req)
-		if err != nil {
-			return nil, err
+	internalRules := []v3.AddRuleToSecurityGroupRequest{
+		{
+			Description:   "RKE2 supervisor API",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     supervisorPort,
+			EndPort:       supervisorPort,
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "etcd client/peer",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     etcdPorts[0],
+			EndPort:       etcdPorts[1],
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "Calico Typha",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     typhaPorts[0],
+			EndPort:       typhaPorts[1],
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "kubelet / kube components",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     otherKubePorts[0],
+			EndPort:       otherKubePorts[1],
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "kube-proxy",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     kubeProxyPorts[0],
+			EndPort:       kubeProxyPorts[1],
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "Node exporter metrics",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     nodeExporter,
+			EndPort:       nodeExporter,
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "Calico BGP",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolTCP,
+			StartPort:     calicoPort,
+			EndPort:       calicoPort,
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "Calico VXLAN",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolUDP,
+			StartPort:     vxlanPorts[0],
+			EndPort:       vxlanPorts[1],
+			SecurityGroup: &sg,
+		},
+		{
+			Description:   "Flannel VXLAN",
+			Protocol:      v3.AddRuleToSecurityGroupRequestProtocolUDP,
+			StartPort:     flannelPorts[0],
+			EndPort:       flannelPorts[1],
+			SecurityGroup: &sg,
+		},
+	}
+
+	dualStack := []string{"0.0.0.0/0", "::/0"}
+	for _, req := range publicRules {
+		for _, sourceCidr := range dualStack {
+			req.FlowDirection = v3.AddRuleToSecurityGroupRequestFlowDirectionIngress
+			req.Network = sourceCidr
+			if err := addRuleToSG(ctx, client, sgID, req); err != nil {
+				return "", err
+			}
 		}
 	}
 
-	return sg, nil
-}
-
-func (d *Driver) createDefaultAffinityGroup(group string) (*egoscale.AffinityGroup, error) {
-	cs := d.client()
-	resp, err := cs.RequestWithContext(context.TODO(), &egoscale.CreateAffinityGroup{
-		Name:        group,
-		Type:        defaultAffinityGroupType,
-		Description: "created by docker-machine",
-	})
-
-	if err != nil {
-		return nil, err
+	for _, req := range internalRules {
+		req.FlowDirection = v3.AddRuleToSecurityGroupRequestFlowDirectionIngress
+		if err := addRuleToSG(ctx, client, sgID, req); err != nil {
+			return "", err
+		}
 	}
 
-	affinityGroup := resp.(*egoscale.AffinityGroup)
-	return affinityGroup, nil
+	return sgID, nil
 }
 
-// Create creates the VM instance acting as the docker host
+func addRuleToSG(ctx context.Context, client *v3.Client, sgID v3.UUID, req v3.AddRuleToSecurityGroupRequest) error {
+	op, err := client.AddRuleToSecurityGroup(ctx, sgID, req)
+	if err != nil {
+		return err
+	}
+	_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+	return err
+}
+
+func (d *Driver) createDefaultAffinityGroup(ctx context.Context, agName string) (v3.UUID, error) {
+	client, err := d.client(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := client.CreateAntiAffinityGroup(ctx, v3.CreateAntiAffinityGroupRequest{
+		Name:        agName,
+		Description: "created by rancher-machine",
+	})
+	if err != nil {
+		return "", err
+	}
+
+	op, err := client.Wait(ctx, resp, v3.OperationStateSuccess)
+	if err != nil {
+		return "", err
+	}
+
+	return op.Reference.ID, nil
+}
+
+// Create creates the Instance acting as the docker host
 func (d *Driver) Create() error {
 	cloudInit, err := d.getCloudInit()
 	if err != nil {
 		return err
 	}
 
+	ctx := context.Background()
 	log.Infof("Querying exoscale for the requested parameters...")
-	client := egoscale.NewClient(d.URL, d.APIKey, d.APISecretKey)
-
-	zones, err := client.ListWithContext(context.TODO(), &egoscale.Zone{
-		Name: d.AvailabilityZone,
-	})
+	client, err := d.client(ctx)
 	if err != nil {
 		return err
 	}
-
-	if len(zones) != 1 {
-		return fmt.Errorf("Availability zone %v doesn't exist",
-			d.AvailabilityZone)
-	}
-	zone := zones[0].(*egoscale.Zone).ID
-	log.Debugf("Availability zone %v = %s", d.AvailabilityZone, zone)
 
 	// Image
-	template := egoscale.Template{
-		IsFeatured: true,
-		ZoneID:     zone,
-	}
-
-	templates, err := client.ListWithContext(context.TODO(), &template)
+	templates, err := client.ListTemplates(ctx)
 	if err != nil {
 		return err
 	}
+
+	template := v3.Template{}
 
 	image := strings.ToLower(d.Image)
 	re := regexp.MustCompile(`^Linux (?P<name>.+?) (?P<version>[0-9.]+)\b`)
 
-	for _, t := range templates {
-		tpl := t.(*egoscale.Template)
-
+	for _, tpl := range templates.Templates {
 		// Keep only 10GiB images
 		if tpl.Size>>30 != 10 {
 			continue
@@ -484,109 +589,145 @@ func (d *Driver) Create() error {
 
 		fullname := strings.ToLower(tpl.Name)
 		if image == fullname {
-			template = *tpl
+			template = tpl
 			break
 		}
 
 		submatch := re.FindStringSubmatch(tpl.Name)
 		if len(submatch) > 0 {
-			name := strings.Replace(strings.ToLower(submatch[1]), " ", "-", -1)
+			name := strings.ReplaceAll(strings.ToLower(submatch[1]), " ", "-")
 			version := submatch[2]
 			shortname := fmt.Sprintf("%s-%s", name, version)
 
 			if image == shortname {
-				template = *tpl
+				template = tpl
 				break
 			}
 		}
 	}
-	if template.ID == nil {
-		return fmt.Errorf("Unable to find image %v", d.Image)
+	if template.ID == "" {
+		return fmt.Errorf("unable to find image %v", d.Image)
 	}
 
 	// Reading the username from the template
-	if name, ok := template.Details["username"]; ok {
-		d.SSHUser = name
+	if template.DefaultUser != "" {
+		d.SSHUser = template.DefaultUser
 	}
 	log.Debugf("Image %v(10) = %s (%s)", d.Image, template.ID, d.SSHUser)
 
 	// Profile UUID
-	profiles, err := client.ListWithContext(context.TODO(), &egoscale.ServiceOffering{
-		Name: d.InstanceProfile,
-	})
+	instTypes, err := client.ListInstanceTypes(ctx)
 	if err != nil {
 		return err
 	}
-	if len(profiles) != 1 {
-		return fmt.Errorf("Unable to find the %s profile",
-			d.InstanceProfile)
+
+	instType, err := instTypes.FindInstanceTypeByIdOrFamilyAndSize(d.InstanceProfile)
+	if err != nil {
+		return err
 	}
-	profile := profiles[0].(*egoscale.ServiceOffering).ID
-	log.Debugf("Profile %v = %s", d.InstanceProfile, profile)
+
+	log.Debugf("Profile %v = %v", d.InstanceProfile, instType)
 
 	// Security groups
-	sgs := make([]egoscale.UUID, 0, len(d.SecurityGroups))
-	for _, group := range d.SecurityGroups {
-		if group == "" {
+	sgs := make([]v3.SecurityGroup, 0, len(d.SecurityGroups))
+	for _, sgName := range d.SecurityGroups {
+		if sgName == "" {
 			continue
 		}
 
-		sg := &egoscale.SecurityGroup{Name: group}
-		if errGet := client.Get(sg); errGet != nil {
-			if _, ok := errGet.(*egoscale.ErrorResponse); !ok {
-				return errGet
-			}
-			log.Infof("Security group %v does not exist. Creating it...", group)
-			securityGroup, errCreate := d.createDefaultSecurityGroup(group)
-			if errCreate != nil {
-				return errCreate
-			}
-			sg.ID = securityGroup.ID
+		sglist, err := client.ListSecurityGroups(ctx)
+		if err != nil {
+			return err
 		}
 
-		log.Debugf("Security group %v = %s", group, sg.ID)
-		sgs = append(sgs, *sg.ID)
+		sg, err := sglist.FindSecurityGroup(sgName)
+		if err != nil && !errors.Is(err, v3.ErrNotFound) {
+			return err
+		}
+
+		var sgID v3.UUID
+		if errors.Is(err, v3.ErrNotFound) {
+			log.Infof("Security group %v does not exist. Creating it...", sgName)
+			newSGID, err := d.createDefaultSecurityGroup(ctx, sgName)
+			if err != nil {
+				return err
+			}
+
+			sgID = newSGID
+		} else {
+			sgID = sg.ID
+		}
+
+		log.Debugf("Security group %v = %s", sgName, sgID)
+		sgs = append(sgs, v3.SecurityGroup{
+			ID: sgID,
+		})
 	}
 
 	// Affinity Groups
-	ags := make([]egoscale.UUID, 0, len(d.AffinityGroups))
+	var ags []v3.AntiAffinityGroup
 	for _, group := range d.AffinityGroups {
 		if group == "" {
 			continue
 		}
-		ag := &egoscale.AffinityGroup{Name: group}
-		if errGet := client.Get(ag); errGet != nil {
-			if _, ok := errGet.(*egoscale.ErrorResponse); !ok {
+
+		agList, err := client.ListAntiAffinityGroups(ctx)
+		if err != nil {
+			return err
+		}
+
+		ag, err := agList.FindAntiAffinityGroup(group)
+		if err != nil && !errors.Is(err, v3.ErrNotFound) {
+			return err
+		}
+
+		var agID v3.UUID
+		if errors.Is(err, v3.ErrNotFound) {
+			log.Infof("Affinity Group %v does not exist, create it", group)
+			newAGID, err := d.createDefaultAffinityGroup(ctx, group)
+			if err != nil {
 				return err
 			}
-			log.Infof("Affinity Group %v does not exist, create it", group)
-			affinityGroup, errCreate := d.createDefaultAffinityGroup(group)
-			if errCreate != nil {
-				return errCreate
-			}
-			ag.ID = affinityGroup.ID
+			agID = newAGID
+		} else {
+			agID = ag.ID
 		}
-		log.Debugf("Affinity group %v = %s", group, ag.ID)
-		ags = append(ags, *ag.ID)
+
+		log.Debugf("Affinity group %v = %s", group, agID)
+		ags = append(ags, v3.AntiAffinityGroup{
+			ID: agID,
+		})
 	}
 
 	// SSH key pair
 	if d.SSHKey == "" {
-		keyPairName := fmt.Sprintf("docker-machine-%s", d.MachineName)
+		keyPairName := fmt.Sprintf("rancher-machine-%s", d.MachineName)
 		log.Infof("Generate an SSH keypair...")
-		resp, errCreate := client.RequestWithContext(context.TODO(), &egoscale.CreateSSHKeyPair{
-			Name: keyPairName,
+
+		err = ssh.GenerateSSHKey(d.GetSSHKeyPath())
+		if err != nil {
+			return err
+		}
+
+		pubKeyPath := d.ResolveStorePath("id_rsa.pub")
+		pubKey, err := os.ReadFile(pubKeyPath)
+		if err != nil {
+			return err
+		}
+
+		op, err := client.RegisterSSHKey(ctx, v3.RegisterSSHKeyRequest{
+			Name:      keyPairName,
+			PublicKey: string(pubKey),
 		})
-		if errCreate != nil {
-			return fmt.Errorf("SSH Key pair creation failed %s", errCreate)
+		if err != nil {
+			return fmt.Errorf("SSH Key pair creation failed %s", err)
 		}
-		keyPair := resp.(*egoscale.SSHKeyPair)
-		if errM := os.MkdirAll(filepath.Dir(d.GetSSHKeyPath()), 0750); errM != nil {
-			return fmt.Errorf("Cannot create the folder to store the SSH private key. %s", errM)
+
+		_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+		if err != nil {
+			return fmt.Errorf("SSH Key pair creation failed %s", err)
 		}
-		if errW := ioutil.WriteFile(d.GetSSHKeyPath(), []byte(keyPair.PrivateKey), 0600); errW != nil {
-			return fmt.Errorf("SSH private key could not be written. %s", errW)
-		}
+
 		d.KeyPair = keyPairName
 	} else {
 		log.Infof("Importing SSH key from %s", d.SSHKey)
@@ -603,9 +744,9 @@ func (d *Driver) Create() error {
 		}
 
 		// Sending the SSH public key through the cloud-init config
-		pubKey, errR := ioutil.ReadFile(sshKey + ".pub")
+		pubKey, errR := os.ReadFile(sshKey + ".pub")
 		if errR != nil {
-			return fmt.Errorf("Cannot read SSH public key %s", errR)
+			return fmt.Errorf("cannot read SSH public key %s", errR)
 		}
 
 		sshAuthorizedKeys := `
@@ -613,13 +754,18 @@ ssh_authorized_keys:
 - `
 		cloudInit = bytes.Join([][]byte{cloudInit, []byte(sshAuthorizedKeys), pubKey}, []byte(""))
 
-		// Copying the private key into docker-machine
+		// Copying the private key into rancher-machine
 		if errCopy := mcnutils.CopyFile(sshKey, d.GetSSHKeyPath()); errCopy != nil {
-			return fmt.Errorf("Unable to copy SSH file: %s", errCopy)
+			return fmt.Errorf("unable to copy SSH file: %s", errCopy)
 		}
 		if errChmod := os.Chmod(d.GetSSHKeyPath(), 0600); errChmod != nil {
-			return fmt.Errorf("Unable to set permissions on the SSH file: %s", errChmod)
+			return fmt.Errorf("unable to set permissions on the SSH file: %s", errChmod)
 		}
+	}
+
+	sshKey, err := client.GetSSHKey(ctx, d.KeyPair)
+	if err != nil {
+		return err
 	}
 
 	log.Infof("Spawn exoscale host...")
@@ -630,82 +776,120 @@ ssh_authorized_keys:
 	d.UserData = cloudInit
 	encodedUserData := base64.StdEncoding.EncodeToString(d.UserData)
 
-	req := &egoscale.DeployVirtualMachine{
-		Details:           map[string]string{"ip6": "true"},
-		TemplateID:        template.ID,
-		ServiceOfferingID: profile,
-		UserData:          encodedUserData,
-		ZoneID:            zone,
-		Name:              d.MachineName,
-		KeyPair:           d.KeyPair,
-		DisplayName:       d.MachineName,
-		RootDiskSize:      d.DiskSize,
-		SecurityGroupIDs:  sgs,
-		AffinityGroupIDs:  ags,
-	}
-	log.Infof("Deploying %s...", req.DisplayName)
-	resp, err := client.RequestWithContext(context.TODO(), req)
+	op, err := client.CreateInstance(ctx, v3.CreateInstanceRequest{
+		Template:           &template,
+		Ipv6Enabled:        v3.Bool(true),
+		DiskSize:           d.DiskSize,
+		InstanceType:       &instType,
+		UserData:           encodedUserData,
+		Name:               d.MachineName,
+		SSHKeys:            []v3.SSHKey{*sshKey},
+		SecurityGroups:     sgs,
+		AntiAffinityGroups: ags,
+	})
 	if err != nil {
 		return err
 	}
 
-	vm := resp.(*egoscale.VirtualMachine)
+	log.Infof("Deploying %s...", d.MachineName)
 
-	IPAddress := vm.IP()
-	if IPAddress != nil {
-		d.IPAddress = IPAddress.String()
+	res, err := client.Wait(ctx, op, v3.OperationStateSuccess)
+	if err != nil {
+		return err
 	}
-	d.ID = vm.ID
+
+	instance, err := client.GetInstance(ctx, res.Reference.ID)
+	if err != nil {
+		return err
+	}
+
+	IPAddress := instance.PublicIP.String()
+	if IPAddress != "<nil>" {
+		d.IPAddress = IPAddress
+	}
+	d.ID = instance.ID
 	log.Infof("IP Address: %v, SSH User: %v", d.IPAddress, d.GetSSHUsername())
 
-	if vm.PasswordEnabled {
-		d.Password = vm.Password
+	if instance.Template != nil && instance.Template.PasswordEnabled != nil && *instance.Template.PasswordEnabled {
+		res, err := client.RevealInstancePassword(ctx, instance.ID)
+		if err != nil {
+			return err
+		}
+
+		d.Password = res.Password
 	}
 
-	// Destroy the SSH key from CloudStack
+	// Destroy the SSH key
 	if d.KeyPair != "" {
 		if err := drivers.WaitForSSH(d); err != nil {
 			return err
 		}
 
-		key := &egoscale.SSHKeyPair{
-			Name: d.KeyPair,
-		}
-		if err := client.DeleteWithContext(context.TODO(), key); err != nil {
+		op, err := client.DeleteSSHKey(ctx, d.KeyPair)
+		if err != nil {
 			return err
 		}
+
+		_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+		if err != nil {
+			return err
+		}
+
 		d.KeyPair = ""
 	}
 
 	return nil
 }
 
-// Start starts the existing VM instance.
+// Start starts the existing Instance.
 func (d *Driver) Start() error {
-	cs := d.client()
-	_, err := cs.RequestWithContext(context.TODO(), &egoscale.StartVirtualMachine{
-		ID: d.ID,
-	})
+	ctx := context.Background()
+	client, err := d.client(ctx)
+	if err != nil {
+		return err
+	}
+
+	op, err := client.StartInstance(ctx, d.ID, v3.StartInstanceRequest{})
+	if err != nil {
+		return err
+	}
+
+	_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
 
 	return err
 }
 
-// Stop stops the existing VM instance.
+// Stop stops the existing Instance.
 func (d *Driver) Stop() error {
-	cs := d.client()
-	_, err := cs.RequestWithContext(context.TODO(), &egoscale.StopVirtualMachine{
-		ID: d.ID,
-	})
+	ctx := context.Background()
+	client, err := d.client(ctx)
+	if err != nil {
+		return err
+	}
+
+	op, err := client.StopInstance(ctx, d.ID)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
 
 	return err
 }
 
-// Restart reboots the existing VM instance.
+// Restart reboots the existing Instance.
 func (d *Driver) Restart() error {
-	cs := d.client()
-	_, err := cs.RequestWithContext(context.TODO(), &egoscale.RebootVirtualMachine{
-		ID: d.ID,
-	})
+	ctx := context.Background()
+	client, err := d.client(ctx)
+	if err != nil {
+		return err
+	}
+
+	op, err := client.RebootInstance(ctx, d.ID)
+	if err != nil {
+		return err
+	}
+	_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
 
 	return err
 }
@@ -715,26 +899,41 @@ func (d *Driver) Kill() error {
 	return d.Stop()
 }
 
-// Remove destroys the VM instance and the associated SSH key.
+// Remove destroys the Instance and the associated SSH key.
 func (d *Driver) Remove() error {
-	client := d.client()
+	ctx := context.Background()
+	client, err := d.client(ctx)
+	if err != nil {
+		return err
+	}
 
-	// Destroy the SSH key from CloudStack
+	// Destroy the SSH key
 	if d.KeyPair != "" {
-		key := &egoscale.SSHKeyPair{Name: d.KeyPair}
-		if err := client.DeleteWithContext(context.TODO(), key); err != nil {
+		op, err := client.DeleteSSHKey(ctx, d.KeyPair)
+		if err != nil {
+			return err
+		}
+
+		_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+		if err != nil {
 			return err
 		}
 	}
 
-	// Destroy the virtual machine
-	if d.ID != nil {
-		vm := &egoscale.VirtualMachine{ID: d.ID}
-		if err := client.DeleteWithContext(context.TODO(), vm); err != nil {
+	// Destroy the Instance
+	if d.ID != "" {
+		op, err := client.DeleteInstance(ctx, d.ID)
+		if err != nil {
+			return err
+		}
+
+		_, err = client.Wait(ctx, op, v3.OperationStateSuccess)
+		if err != nil {
 			return err
 		}
 	}
 
+	//TODO: cleanup Anti-Affinities and Security-Groups, not urgent for now.
 	log.Infof("The Anti-Affinity group and Security group were not removed")
 
 	return nil
@@ -745,7 +944,7 @@ func (d *Driver) Remove() error {
 func (d *Driver) getCloudInit() ([]byte, error) {
 	var err error
 	if d.UserDataFile != "" {
-		d.UserData, err = ioutil.ReadFile(d.UserDataFile)
+		d.UserData, err = os.ReadFile(d.UserDataFile)
 	}
 
 	return d.UserData, err

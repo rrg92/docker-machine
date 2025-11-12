@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -240,7 +239,7 @@ func (d *Driver) PreCreateCheck() error {
 func (d *Driver) Create() error {
 	var userdata string
 	if d.UserDataFile != "" {
-		buf, err := ioutil.ReadFile(d.UserDataFile)
+		buf, err := os.ReadFile(d.UserDataFile)
 		if err != nil {
 			return err
 		}
@@ -298,18 +297,22 @@ func (d *Driver) Create() error {
 				d.PrivateIPAddress = network.IPAddress
 			}
 		}
+		if d.IPv6 {
+			d.IPv6Address, _ = newDroplet.PublicIPv6()
+		}
 
-		if d.IPAddress != "" && (!d.PrivateNetworking || d.PrivateIPAddress != "") {
+		if d.IPAddress != "" && (!d.PrivateNetworking || d.PrivateIPAddress != "") && (!d.IPv6 || d.IPv6Address != "") {
 			break
 		}
 
 		time.Sleep(5 * time.Second)
 	}
 
-	log.Debugf("Created droplet ID %d, IP address %s, Private IP address %s",
+	log.Debugf("Created droplet ID %d, IP address %s, Private IP address %s, IPv6 address %s",
 		newDroplet.ID,
 		d.IPAddress,
-		d.PrivateIPAddress)
+		d.PrivateIPAddress,
+		d.IPv6Address)
 
 	return nil
 }
@@ -319,8 +322,11 @@ func (d *Driver) createSSHKey() (*godo.Key, error) {
 
 	if d.SSHKeyFingerprint != "" {
 		key, resp, err := d.getClient().Keys.GetByFingerprint(context.TODO(), d.SSHKeyFingerprint)
-		if err != nil && resp.StatusCode == 404 {
-			return nil, fmt.Errorf("Digital Ocean SSH key with fingerprint %s doesn't exist", d.SSHKeyFingerprint)
+		if err != nil {
+			if resp != nil && resp.StatusCode == 404 {
+				return nil, fmt.Errorf("digital Ocean SSH key with fingerprint %s doesn't exist", d.SSHKeyFingerprint)
+			}
+			return nil, err
 		}
 
 		if d.SSHKey == "" {
@@ -338,7 +344,7 @@ func (d *Driver) createSSHKey() (*godo.Key, error) {
 		return nil, err
 	}
 
-	publicKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
+	publicKey, err := os.ReadFile(d.publicSSHKeyPath())
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +419,7 @@ func (d *Driver) Remove() error {
 	client := d.getClient()
 	if d.SSHKeyFingerprint == "" && d.SSHKeyID != 0 {
 		if resp, err := client.Keys.DeleteByID(context.TODO(), d.SSHKeyID); err != nil {
-			if resp.StatusCode == 404 {
+			if resp != nil && resp.StatusCode == 404 {
 				log.Infof("Digital Ocean SSH key doesn't exist, assuming it is already deleted")
 			} else {
 				return err

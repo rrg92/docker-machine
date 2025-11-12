@@ -3,7 +3,6 @@ package vmwarevsphere
 import (
 	"archive/tar"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
@@ -59,7 +58,7 @@ func (d *Driver) getDatastore(spec *types.VirtualMachineConfigSpec) (*object.Dat
 		return d.finder.Datastore(d.getCtx(), d.Datastore)
 	}
 
-	//nothing set, try default ds cluster then default ds
+	// nothing set, try default ds cluster then default ds
 	log.Infof("Finding default datastore cluster")
 	sp, err := d.finder.DefaultDatastoreCluster(d.getCtx())
 	if err != nil {
@@ -190,7 +189,7 @@ func (d *Driver) generateKeyBundle() error {
 		return err
 	}
 
-	pubKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
+	pubKey, err := os.ReadFile(d.publicSSHKeyPath())
 	if err != nil {
 		return err
 	}

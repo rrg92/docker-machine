@@ -43,6 +43,9 @@ func init() {
 func NewRedHatProvisioner(osReleaseID string, d drivers.Driver) *RedHatProvisioner {
 	systemdProvisioner := NewSystemdProvisioner(osReleaseID, d)
 	systemdProvisioner.SSHCommander = RedHatSSHCommander{Driver: d}
+	// need to install "openssh" and "openssl" together with "curl" since curl installation was causing "openssl"
+	// to auto-upgrade and because of that "openssh" version was out of sync with "openssl" which was causing ssh failure
+	systemdProvisioner.Packages = []string{"curl openssh openssl"}
 	return &RedHatProvisioner{
 		systemdProvisioner,
 	}

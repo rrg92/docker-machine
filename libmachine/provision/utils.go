@@ -2,8 +2,8 @@ package provision
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -33,7 +33,7 @@ func installDockerGeneric(p Provisioner, baseURL string) error {
 	// just install it using the docker repos
 	log.Infof("Installing Docker from: %s", baseURL)
 	if output, err := p.SSHCommand(fmt.Sprintf("if ! type docker; then curl -sSL %s | sh -; fi", baseURL)); err != nil {
-		return fmt.Errorf("Error installing Docker: %s", output)
+		return fmt.Errorf("error installing Docker: %s", output)
 	}
 
 	return nil
@@ -73,28 +73,34 @@ func ConfigureAuth(p Provisioner) error {
 	org := mcnutils.GetUsername() + "." + machineName
 	bits := 2048
 
+	// preference: IPv4 address, then IPv6 address
 	ip, err := driver.GetIP()
 	if err != nil {
-		return err
+		log.Warnf("Error getting IPv4 address: %s", err)
+		log.Debug("Getting IPv6 address")
+		ip, err = driver.GetIPv6()
+		if err != nil {
+			return fmt.Errorf("error getting IPv6 address: %s", err)
+		}
 	}
 
 	log.Info("Copying certs to the local machine directory...")
 
 	if err := mcnutils.CopyFile(authOptions.CaCertPath, filepath.Join(authOptions.StorePath, "ca.pem")); err != nil {
-		return fmt.Errorf("Copying ca.pem to machine dir failed: %s", err)
+		return fmt.Errorf("copying ca.pem to machine dir failed: %s", err)
 	}
 
 	if err := mcnutils.CopyFile(authOptions.ClientCertPath, filepath.Join(authOptions.StorePath, "cert.pem")); err != nil {
-		return fmt.Errorf("Copying cert.pem to machine dir failed: %s", err)
+		return fmt.Errorf("copying cert.pem to machine dir failed: %s", err)
 	}
 
 	if err := mcnutils.CopyFile(authOptions.ClientKeyPath, filepath.Join(authOptions.StorePath, "key.pem")); err != nil {
-		return fmt.Errorf("Copying key.pem to machine dir failed: %s", err)
+		return fmt.Errorf("copying key.pem to machine dir failed: %s", err)
 	}
 
 	// The Host IP is always added to the certificate's SANs list
 	hosts := append(authOptions.ServerCertSANs, ip, "localhost")
-	log.Debugf("generating server cert: %s ca-key=%s private-key=%s org=%s san=%s",
+	log.Debugf("Generating server cert: %s ca-key=%s private-key=%s org=%s san=%s",
 		authOptions.ServerCertPath,
 		authOptions.CaCertPath,
 		authOptions.CaPrivateKeyPath,
@@ -128,16 +134,16 @@ func ConfigureAuth(p Provisioner) error {
 	}
 
 	// upload certs and configure TLS auth
-	caCert, err := ioutil.ReadFile(authOptions.CaCertPath)
+	caCert, err := os.ReadFile(authOptions.CaCertPath)
 	if err != nil {
 		return err
 	}
 
-	serverCert, err := ioutil.ReadFile(authOptions.ServerCertPath)
+	serverCert, err := os.ReadFile(authOptions.ServerCertPath)
 	if err != nil {
 		return err
 	}
-	serverKey, err := ioutil.ReadFile(authOptions.ServerKeyPath)
+	serverKey, err := os.ReadFile(authOptions.ServerKeyPath)
 	if err != nil {
 		return err
 	}
@@ -248,7 +254,7 @@ func decideStorageDriver(p Provisioner, defaultDriver, suppliedDriver string) (s
 func getFilesystemType(p Provisioner, directory string) (string, error) {
 	statCommandOutput, err := p.SSHCommand("stat -f -c %T " + directory)
 	if err != nil {
-		err = fmt.Errorf("Error looking up filesystem type: %s", err)
+		err = fmt.Errorf("error looking up filesystem type: %s", err)
 		return "", err
 	}
 
@@ -272,8 +278,10 @@ func checkDaemonUp(p Provisioner, dockerPort int) func() bool {
 
 // waitForCloudInit runs `cloud-init status --wait` on the node in order to wait for the node to be ready before
 // continuing execution.
+// it also swallows the "bad" exit code that can be returned but is in reality just alerting us that there were benign
+// errors during cloud-init: https://docs.cloud-init.io/en/24.1/explanation/failure_states.html#recoverable-failure
 func waitForCloudInit(p Provisioner) error {
-	_, err := p.SSHCommand("sudo cloud-init status --wait")
+	_, err := p.SSHCommand(`sudo bash -c 'cloud-init status --wait >/dev/null || if [ $? == 2 ]; then true ; fi'`)
 	if err != nil {
 		return fmt.Errorf("failed to wait for cloud-init: %w", err)
 	}
@@ -328,10 +336,10 @@ func waitForLock(ssh SSHCommander, cmd string) error {
 		return true
 	})
 	if sshErr != nil {
-		return fmt.Errorf("Error running %q: %s", cmd, sshErr)
+		return fmt.Errorf("error running %q: %s", cmd, sshErr)
 	}
 	if err != nil {
-		return fmt.Errorf("Failed to obtain lock: %s", err)
+		return fmt.Errorf("failed to obtain lock: %s", err)
 	}
 	return nil
 }

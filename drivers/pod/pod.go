@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"time"
 
 	"github.com/rancher/machine/libmachine/drivers"
@@ -13,8 +13,8 @@ import (
 	"github.com/rancher/machine/libmachine/mcnflag"
 	"github.com/rancher/machine/libmachine/ssh"
 	"github.com/rancher/machine/libmachine/state"
-	"github.com/rancher/wrangler/pkg/apply"
-	"github.com/rancher/wrangler/pkg/objectset"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	"github.com/rancher/wrangler/v3/pkg/objectset"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -100,7 +100,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 func (d *Driver) PreCreateCheck() error {
 	if d.Userdata != "" {
 		// Check we can read user data
-		_, err := ioutil.ReadFile(d.Userdata)
+		_, err := os.ReadFile(d.Userdata)
 		if err != nil {
 			return fmt.Errorf("cannot read userdata file %v: %v", d.Userdata, err)
 		}
@@ -109,35 +109,41 @@ func (d *Driver) PreCreateCheck() error {
 	return nil
 }
 
+// getWaitForIP watches for the pod to be assigned an IP address and returns it.
 func getWaitForIP(ctx context.Context, k8s kubernetes.Interface, namespace, name string) (string, error) {
-	_, err := k8s.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
+	pod, err := k8s.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
 		return "", err
+	}
+	if pod != nil && pod.Status.PodIP != "" {
+		return pod.Status.PodIP, nil
+	}
+
+	// If we got a pod from the Get call, use its resource version to start the watch.
+	// This prevents a race condition where an update could be missed between the Get and Watch.
+	resourceVersion := ""
+	if pod != nil {
+		resourceVersion = pod.ResourceVersion
 	}
 
 	w, err := k8s.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector:  "metadata.name=" + name,
-		TimeoutSeconds: &[]int64{600}[0],
+		FieldSelector:   "metadata.name=" + name,
+		ResourceVersion: resourceVersion,
 	})
 	if err != nil {
 		return "", err
 	}
+	defer w.Stop()
 
-	var ip string
 	for event := range w.ResultChan() {
 		if pod, ok := event.Object.(*corev1.Pod); ok {
 			if pod.Status.PodIP != "" {
-				ip = pod.Status.PodIP
-				w.Stop()
+				return pod.Status.PodIP, nil
 			}
 		}
 	}
 
-	if ip == "" {
-		return "", fmt.Errorf("failed to get IP of %s/%s", namespace, name)
-	}
-
-	return ip, nil
+	return "", fmt.Errorf("watch closed before IP was found for pod %s/%s (context timeout exceeded?)", namespace, name)
 }
 
 func getClient() (string, kubernetes.Interface, apply.Apply, error) {
@@ -233,14 +239,14 @@ func (d *Driver) Start() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
 	defer cancel()
 
-	pubKeyData, err := ioutil.ReadFile(d.ResolveStorePath("id_rsa.pub"))
+	pubKeyData, err := os.ReadFile(d.ResolveStorePath("id_rsa.pub"))
 	if err != nil {
 		return err
 	}
 
 	var userdata []byte
 	if d.Userdata != "" {
-		userdata, err = ioutil.ReadFile(d.Userdata)
+		userdata, err = os.ReadFile(d.Userdata)
 		if err != nil {
 			return err
 		}
@@ -267,25 +273,12 @@ func (d *Driver) Start() error {
 		return err
 	}
 
-	w, err := k8s.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
-		TimeoutSeconds: &[]int64{600}[0],
-	})
+	ip, err := getWaitForIP(ctx, k8s, namespace, d.MachineName)
 	if err != nil {
 		return err
 	}
-
-	for event := range w.ResultChan() {
-		if pod, ok := event.Object.(*corev1.Pod); ok {
-			if pod.Status.PodIP != "" {
-				d.IPAddress = pod.Status.PodIP
-				w.Stop()
-			}
-		}
-	}
-
-	if d.IPAddress == "" {
-		return fmt.Errorf("failed to get IP of %s/%s", namespace, d.MachineName)
-	}
+	d.IPAddress = ip
+	log.Infof("Created pod instance %s/%s, IP address %s", namespace, d.MachineName, d.IPAddress)
 
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,6 +45,8 @@ const (
 	PluginEnvKey        = "MACHINE_PLUGIN_TOKEN"
 	PluginEnvVal        = "42"
 	PluginEnvDriverName = "MACHINE_PLUGIN_DRIVER_NAME"
+	PluginUID           = "MACHINE_PLUGIN_UID"
+	PluginGID           = "MACHINE_PLUGIN_GID"
 )
 
 type PluginStreamer interface {
@@ -107,13 +110,10 @@ func (e ErrPluginBinaryNotFound) Error() string {
 	return fmt.Sprintf("Driver %q not found. Do you have the plugin binary %q accessible in your PATH?", e.driverName, e.driverPath)
 }
 
-// driverPath finds the path of a driver binary by its name.
-//   - If the driver is a core driver, there is no separate driver binary. We reuse current binary if it's `docker-machine`
-//
-// or we assume `docker-machine` is in the PATH.
-//   - If the driver is NOT a core driver, then the separate binary must be in the PATH and it's name must be
-//
-// `docker-machine-driver-driverName`
+// driverPath locates the path of a driver binary based on its name.
+//   - For core drivers, there is no separate driver binary. The current binary is reused if it's `docker-machine`,
+//     or it is assumed that `docker-machine` is available in the PATH.
+//   - For non-core drivers, a separate binary must be in the PATH with the name `docker-machine-driver-driverName`.
 func driverPath(driverName string) string {
 	for _, coreDriver := range CoreDrivers {
 		if coreDriver == driverName {
@@ -128,11 +128,23 @@ func driverPath(driverName string) string {
 	return fmt.Sprintf("docker-machine-driver-%s", driverName)
 }
 
+// NewPlugin creates a Plugin for the specified driver.
+//
+// The `driverName` can be either a simple name or an absolute path to the driver:
+//   - If `driverName` is a simple name, "docker-machine-driver-" is prepended to it,
+//     and the executable is searched for in the directories listed in the PATH environment variable.
+//   - If `driverName` is an absolute path, the executable is searched for at that specific location.
 func NewPlugin(driverName string) (*Plugin, error) {
-	driverPath := driverPath(driverName)
-	binaryPath, err := exec.LookPath(driverPath)
+	var path string
+	dir, name := filepath.Split(driverName)
+	if dir == "" {
+		path = driverPath(driverName)
+	} else {
+		path = driverName
+	}
+	binaryPath, err := exec.LookPath(path)
 	if err != nil {
-		return nil, ErrPluginBinaryNotFound{driverName, driverPath}
+		return nil, ErrPluginBinaryNotFound{name, path}
 	}
 
 	log.Debugf("Found binary path at %s", binaryPath)
@@ -141,7 +153,7 @@ func NewPlugin(driverName string) (*Plugin, error) {
 		stopCh: make(chan bool),
 		addrCh: make(chan string, 1),
 		Executor: &Executor{
-			DriverName: driverName,
+			DriverName: name,
 			binaryPath: binaryPath,
 		},
 	}, nil
@@ -154,8 +166,11 @@ func (lbe *Executor) Start() (*bufio.Scanner, *bufio.Scanner, error) {
 
 	// The child process that gets executed when we run this subcommand will already inherit all this process' envvars,
 	// but we still need to pass all command-line arguments to it manually.
-	lbe.cmd = exec.Command(lbe.binaryPath, os.Args...)
-
+	cmd, err := getCommand(lbe.binaryPath, os.Args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Error getting cmd: %v", err)
+	}
+	lbe.cmd = cmd
 	lbe.pluginStdout, err = lbe.cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Error getting cmd stdout pipe: %s", err)
