@@ -1,59 +1,65 @@
-# Rancher Machine, a fork of [Docker Machine](https://github.com/docker/machine)
+# Rancher(Rod) Machine, a fork of [Docker Machine](https://github.com/docker/machine)
 
-Machine lets you create Docker hosts on your computer, on cloud providers, and inside your own data center.  
-It creates servers, installs Docker on them, then configures the Docker client to talk to them.
+Hello! My name is Rodrigo and this is fork of Rancher Machine (which is a fork of Docker Machine), which I called rod-machine.  
+The main objective of this fork was add support to Azure Spot to use in a gitlab instance maintaned by me.  
+Due lack of support to support in upstream project, I first forked and added the support. I plan add this back to original project as PR if not implemented yet.  
 
-## Azure-Specific Enhancements
 
-Rancher Machine is a fork of the popular [Docker Machine](https://github.com/docker/machine) tool, designed to simplify the process of managing Docker hosts on various cloud platforms. This enhanced version introduces specific adjustments tailored for Azure, with a particular focus on leveraging Azure Spot instances to optimize costs, especially beneficial for use cases like GitLab runners.
+## Azure-Specific Enhancements of rod-machine
 
 ### Key Enhancements in This Version:
 
 #### Azure Spot Integration
 One of the notable enhancements in this version of Rancher Machine is the integration of Azure Spot parameters. Azure Spot VMs offer a cost-effective solution for running interruptible workloads, allowing users to take advantage of unused Azure capacities at significantly reduced prices. This feature is particularly useful for scaling GitLab runners or other CI/CD tools, where flexibility in workload management can lead to substantial cost savings.
 
-#### Focused on Azure
-While Rancher Machine supports multiple cloud providers, this version includes optimizations and additional features specifically designed for Azure users. These enhancements aim to streamline the deployment and management of Docker hosts on Azure, making it more efficient and cost-effective.
+#### Focused on Azure and GitLab Runner
+While Rancher Machine supports multiple cloud providers, this version includes optimizations and additional features specifically designed for Azure users. 
+These enhancements aim to streamline the deployment and management of Docker hosts on Azure, making it more efficient and cost-effective.
+
 
 ### Getting Started
 
-To begin using this enhanced version of Rancher Machine with Azure, follow these steps:
+The easy way to use is just donwload latest release using wget and copying to some directory in PATH environment.  
 
-1. **Building Rancher Machine**: For instructions on compiling Rancher Machine from source, refer to the [build documentation](BUILDING.md). The build guide provides detailed steps to help you compile the tool, ensuring you have the latest version with all enhancements included.
+### Building 
 
-2. **Azure Usage Guide**: For detailed instructions on using Rancher Machine with Azure, including how to leverage Azure-specific features and optimizations, consult the [Azure start guide](drivers/azure). This guide covers everything from authentication and VM creation to advanced Azure Spot configurations, providing a comprehensive resource for effectively managing Docker hosts on Azure.
+As you noted, this project is a GO project.  
+To build a new executable is relativelly simple:
 
-### Conclusion
+1. install make and docker 
+2. Clone this repository
+3. Make desired changes
+4. Tag in format vx.y.z (it uses tagging to generate verison)
+4. Run make 
+5. It will generate executable in bin/rancher-machine and distributable in dist/ 
+6. run bin/rancher-machine -v to confirm is compiled the version you built
 
-This enhanced version of Rancher Machine is an invaluable tool for developers and DevOps professionals working with Docker on Azure.  
-The main purpose of this changes is use with gitlab.  
-By incorporating Azure Spot functionality and other Azure-specific enhancements, it offers a more tailored and cost-efficient solution for container management in the cloud.  
-Whether you're scaling GitLab runners or managing a fleet of Docker hosts, this version of Rancher Machine is designed to meet your needs with Azure in mind.
+### Merging upstream 
 
-Machine lets you create Docker hosts on your computer, on cloud providers, and
-inside your own data center. It creates servers, installs Docker on them, then
-configures the Docker client to talk to them.
+Maybe you can want merge with upstream (the rancher/docker-machine) which can contains cool updates, like latest docker client packages.  
+The process is simple (if no conflicts with your changes). You can use UI or command line.  
+
+Using command line:  
+
+1. Clone repo 
+2. Add upstream: git remote add upstream https://github.com/rancher/machine
+3. pull:   git pull upstream 
+4. merge:  git merge upstream/master 
+5. Resolve conflics, if any.
+6. Commit 
+7. Make build (as described in previous section)
+8. Resolve errors if any 
+9. If all is ok, tag and run make build  
+10. Commit to save!
 
 
-## Installation and documentation
-The original full Docker Machine documentation [is available here](https://gcbw.github.io/docker.github.io/machine/).
+For this project, I just generate the executable in bin and upload  git release.  
 
-This project is intended to be embedded and executed by the full [Rancher](https://github.com/rancher/rancher) product
-and the stand alone cli functionality will remain but the human use of it will not be the primary focus as we will expect
-inputs provided by other things like Terraform or UIs.
+For more details of build process, check [BUILDING.md](BUILDING.md), which is the original file provided by upstream project. I used here to start.  
 
-Cli binaries can be found in our [Releases Pages](https://github.com/rancher/machine/releases)
 
-## Issues
+## Azure Usage Guide  
 
-For historical context you can read the [Docker Machine Issues](https://github.com/docker/machine/issues)
-but all new issues created for Rancher Machine will need to be created 
-in [Rancher](https://github.com/rancher/rancher/issues) 
-
-## Driver Plugins
-
-In addition to the core driver plugins bundled alongside Rancher Machine, users
-can make and distribute their own plugin for any virtualization technology or
-cloud provider.  To browse the list of known Rancher Machine plugins, please [see
-this document in our
-docs repo](https://github.com/docker/docker.github.io/blob/master/machine/AVAILABLE_DRIVER_PLUGINS.md).
+I addes some doc into the azure provider docs.
+Consult the [Azure start guide](drivers/azure).  
+This guide covers everything from authentication and VM creation to advanced Azure Spot configurations, providing a comprehensive resource for effectively managing Docker hosts on Azure.
